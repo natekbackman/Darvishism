@@ -1,0 +1,1422 @@
+```{r, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(caret)
+```
+
+# functions
+
+```{r}
+get_seed <- function() {
+  str_extract_all(string = Sys.time(), 
+                  pattern = "\\d+")[[1]][4:6] %>% 
+    paste(collapse = "") %>% 
+    as.numeric()
+}
+```
+
+
+# 4-Seam Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_ff == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>%
+  drop_na(`avg_y_4-Seam Fastball`) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_,  
+         norm_rmse = NA_character_) -> ff_val
+
+val_pit = list(pitcher = ff_val$pitcher,
+               cluster = ff_val$cluster)
+
+index = 0
+
+for (pit in val_pit$pitcher) {
+  index = index + 1
+
+  # previous year for similarity
+  prev_year = similarity %>% 
+    filter(pitcher1 == pit) %>% 
+    distinct(year1) %>% 
+    arrange(desc(year1)) %>% 
+    filter(year1 != 2023) %>% 
+    slice_head() %>% 
+    .[[1]]
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             # standardized > 0.5 &
+             year1 == prev_year) %>% 
+    select(pitcher2, standardized, cluster2, year2) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "4-Seam Fastball"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    right_join(case_weights, by = c("pitcher" = "pitcher2",
+                                    "cluster" = "cluster2",
+                                    "game_year" = "year2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"))
+  
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) %>% 
+    arrange(desc(case_wts)) %>% 
+    slice_head(n = 200) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = `avg_y_4-Seam Fastball`)
+  
+  formula <-
+    recipe(`avg_y_4-Seam Fastball` ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  future::plan("multisession")
+  doParallel::registerDoParallel(cores = 2)
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 50,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, metric = "rmse") %>% 
+    slice_head()
+  
+  proj_velo = velo_val %>% 
+    filter(pitcher == pit &
+             cluster == ff_val$cluster[index] &
+             pitch_type == proj_pit) %>% 
+    pull(proj_velo) %>% 
+    .[[1]]
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & 
+             game_year == 2023 &
+             cluster == val_pit$cluster[index]) %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}")))) %>% 
+    mutate(`avg_velo_4-Seam Fastball` = proj_velo)
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, metric = "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  ff_val$proj_y[index] = proj_y
+  ff_val$mean_rmse[index] = best_params$mean
+  ff_val$rmse_se[index] = best_params$std_err
+  ff_val$norm_rmse[index] = best_params$mean / 
+    (max(model_data$`avg_y_4-Seam Fastball`) -
+       min(model_data$`avg_y_4-Seam Fastball`))
+
+  # clear parallel processing
+  future::plan("sequential")
+  doParallel::stopImplicitCluster()
+}
+
+ff_val %>% 
+  select(pitcher, cluster, game_year,
+         `avg_y_4-Seam Fastball`, proj_y, mean_rmse, rmse_se, norm_rmse) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_4-Seam Fastball") %>%
+  mutate(proj_y = proj_y %>% as.numeric(),
+         mean_rmse = mean_rmse %>% as.numeric(),
+         rmse_se = rmse_se %>% as.numeric(),
+         accurate = ifelse(avg_y < proj_y + mean_rmse & 
+                             avg_y > proj_y - mean_rmse, 1, 0)) -> ff_val
+```
+
+
+# Changeup Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_ch == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>%
+  drop_na(avg_y_Changeup) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_,  
+         norm_rmse = NA_character_) -> ch_val
+
+val_pit = list(pitcher = ch_val$pitcher,
+               cluster = ch_val$cluster)
+
+index = 0
+
+for (pit in val_pit$pitcher) {
+  index = index + 1
+
+  # previous year for similarity
+  prev_year = similarity %>% 
+    filter(pitcher1 == pit) %>% 
+    distinct(year1) %>% 
+    arrange(desc(year1)) %>% 
+    filter(year1 != 2023) %>% 
+    slice_head() %>% 
+    .[[1]]
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             # standardized > 0.5 &
+             year1 == prev_year) %>% 
+    select(pitcher2, standardized, cluster2, year2) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "Changeup"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    right_join(case_weights, by = c("pitcher" = "pitcher2",
+                                    "cluster" = "cluster2",
+                                    "game_year" = "year2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"))
+  
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) %>% 
+    arrange(desc(case_wts)) %>% 
+    slice_head(n = 200) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = avg_y_Changeup)
+  
+  formula <-
+    recipe(avg_y_Changeup ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  future::plan("multisession")
+  doParallel::registerDoParallel(cores = 2)
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 50,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, metric = "rmse") %>% 
+    slice_head()
+  
+  proj_velo = velo_val %>% 
+    filter(pitcher == pit &
+             cluster == ch_val$cluster[index] &
+             pitch_type == proj_pit) %>% 
+    pull(proj_velo) %>% 
+    .[[1]]
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & 
+             game_year == 2023 &
+             cluster == val_pit$cluster[index]) %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}")))) %>% 
+    mutate(avg_velo_Changeup = proj_velo)
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, metric = "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  ch_val$proj_y[index] = proj_y
+  ch_val$mean_rmse[index] = best_params$mean
+  ch_val$rmse_se[index] = best_params$std_err
+  ch_val$norm_rmse[index] = best_params$mean / 
+    (max(model_data$avg_y_Changeup) -
+       min(model_data$avg_y_Changeup))
+
+  # clear parallel processing
+  future::plan("sequential")
+  doParallel::stopImplicitCluster()
+}
+
+ch_val %>% 
+  select(pitcher, cluster, game_year,
+         avg_y_Changeup, proj_y, mean_rmse, rmse_se, norm_rmse) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_Changeup") %>%
+  mutate(proj_y = proj_y %>% as.numeric(),
+         mean_rmse = mean_rmse %>% as.numeric(),
+         rmse_se = rmse_se %>% as.numeric(),
+         accurate = ifelse(avg_y < proj_y + mean_rmse & 
+                             avg_y > proj_y - mean_rmse, 1, 0)) -> ch_val
+```
+
+
+# Curveball Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_cu == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>%
+  drop_na(avg_y_Curveball) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_,  
+         norm_rmse = NA_character_) -> cu_val
+
+val_pit = list(pitcher = cu_val$pitcher,
+               cluster = cu_val$cluster)
+
+index = 0
+
+for (pit in val_pit$pitcher) {
+  index = index + 1
+
+  # previous year for similarity
+  prev_year = similarity %>% 
+    filter(pitcher1 == pit) %>% 
+    distinct(year1) %>% 
+    arrange(desc(year1)) %>% 
+    filter(year1 != 2023) %>% 
+    slice_head() %>% 
+    .[[1]]
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             # standardized > 0.5 &
+             year1 == prev_year) %>% 
+    select(pitcher2, standardized, cluster2, year2) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "Curveball"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    right_join(case_weights, by = c("pitcher" = "pitcher2",
+                                    "cluster" = "cluster2",
+                                    "game_year" = "year2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"))
+  
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) %>% 
+    arrange(desc(case_wts)) %>% 
+    slice_head(n = 200) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = avg_y_Curveball)
+  
+  formula <-
+    recipe(avg_y_Curveball ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  future::plan("multisession")
+  doParallel::registerDoParallel(cores = 2)
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 50,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, metric = "rmse") %>% 
+    slice_head()
+  
+  proj_velo = velo_val %>% 
+    filter(pitcher == pit &
+             cluster == cu_val$cluster[index] &
+             pitch_type == proj_pit) %>% 
+    pull(proj_velo) %>% 
+    .[[1]]
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & 
+             game_year == 2023 &
+             cluster == val_pit$cluster[index]) %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}")))) %>% 
+    mutate(avg_velo_Curveball = proj_velo)
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, metric = "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  cu_val$proj_y[index] = proj_y
+  cu_val$mean_rmse[index] = best_params$mean
+  cu_val$rmse_se[index] = best_params$std_err
+  cu_val$norm_rmse[index] = best_params$mean / 
+    (max(model_data$avg_y_Curveball) -
+       min(model_data$avg_y_Curveball))
+
+  # clear parallel processing
+  future::plan("sequential")
+  doParallel::stopImplicitCluster()
+}
+
+cu_val %>% 
+  select(pitcher, cluster, game_year,
+         avg_y_Curveball, proj_y, mean_rmse, rmse_se, norm_rmse) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_Curveball") %>%
+  mutate(proj_y = proj_y %>% as.numeric(),
+         mean_rmse = mean_rmse %>% as.numeric(),
+         rmse_se = rmse_se %>% as.numeric(),
+         accurate = ifelse(avg_y < proj_y + mean_rmse & 
+                             avg_y > proj_y - mean_rmse, 1, 0)) -> cu_val
+```
+
+
+# Cutter Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_ct == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>%
+  drop_na(avg_y_Cutter) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_,  
+         norm_rmse = NA_character_) -> ct_val
+
+val_pit = list(pitcher = ct_val$pitcher,
+               cluster = ct_val$cluster)
+
+index = 0
+
+for (pit in val_pit$pitcher) {
+  index = index + 1
+
+  # previous year for similarity
+  prev_year = similarity %>% 
+    filter(pitcher1 == pit) %>% 
+    distinct(year1) %>% 
+    arrange(desc(year1)) %>% 
+    filter(year1 != 2023) %>% 
+    slice_head() %>% 
+    .[[1]]
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             # standardized > 0.5 &
+             year1 == prev_year) %>% 
+    select(pitcher2, standardized, cluster2, year2) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "Cutter"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    right_join(case_weights, by = c("pitcher" = "pitcher2",
+                                    "cluster" = "cluster2",
+                                    "game_year" = "year2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"))
+  
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) %>% 
+    arrange(desc(case_wts)) %>% 
+    slice_head(n = 200) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = avg_y_Cutter)
+  
+  formula <-
+    recipe(avg_y_Cutter ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  future::plan("multisession")
+  doParallel::registerDoParallel(cores = 2)
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 50,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, metric = "rmse") %>% 
+    slice_head()
+  
+  proj_velo = velo_val %>% 
+    filter(pitcher == pit &
+             cluster == ct_val$cluster[index] &
+             pitch_type == proj_pit) %>% 
+    pull(proj_velo) %>% 
+    .[[1]]
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & 
+             game_year == 2023 &
+             cluster == val_pit$cluster[index]) %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}")))) %>% 
+    mutate(avg_velo_Cutter = proj_velo)
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, metric = "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  ct_val$proj_y[index] = proj_y
+  ct_val$mean_rmse[index] = best_params$mean
+  ct_val$rmse_se[index] = best_params$std_err
+  ct_val$norm_rmse[index] = best_params$mean / 
+    (max(model_data$avg_y_Cutter) -
+       min(model_data$avg_y_Cutter))
+
+  # clear parallel processing
+  future::plan("sequential")
+  doParallel::stopImplicitCluster()
+}
+
+ct_val %>% 
+  select(pitcher, cluster, game_year,
+         avg_y_Cutter, proj_y, mean_rmse, rmse_se, norm_rmse) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_Cutter") %>%
+  mutate(proj_y = proj_y %>% as.numeric(),
+         mean_rmse = mean_rmse %>% as.numeric(),
+         rmse_se = rmse_se %>% as.numeric(),
+         accurate = ifelse(avg_y < proj_y + mean_rmse & 
+                             avg_y > proj_y - mean_rmse, 1, 0)) -> ct_val
+```
+
+
+# Sinker Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_si == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>%
+  drop_na(avg_y_Sinker) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_,  
+         norm_rmse = NA_character_) -> si_val
+
+val_pit = list(pitcher = si_val$pitcher,
+               cluster = si_val$cluster)
+
+index = 0
+
+for (pit in val_pit$pitcher) {
+  index = index + 1
+
+  # previous year for similarity
+  prev_year = similarity %>% 
+    filter(pitcher1 == pit) %>% 
+    distinct(year1) %>% 
+    arrange(desc(year1)) %>% 
+    filter(year1 != 2023) %>% 
+    slice_head() %>% 
+    .[[1]]
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             # standardized > 0.5 &
+             year1 == prev_year) %>% 
+    select(pitcher2, standardized, cluster2, year2) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "Sinker"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    right_join(case_weights, by = c("pitcher" = "pitcher2",
+                                    "cluster" = "cluster2",
+                                    "game_year" = "year2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"))
+  
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) %>% 
+    arrange(desc(case_wts)) %>% 
+    slice_head(n = 200) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = avg_y_Sinker)
+  
+  formula <-
+    recipe(avg_y_Sinker ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  future::plan("multisession")
+  doParallel::registerDoParallel(cores = 2)
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 50,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, metric = "rmse") %>% 
+    slice_head()
+  
+  proj_velo = velo_val %>% 
+    filter(pitcher == pit &
+             cluster == si_val$cluster[index] &
+             pitch_type == proj_pit) %>% 
+    pull(proj_velo) %>% 
+    .[[1]]
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & 
+             game_year == 2023 &
+             cluster == val_pit$cluster[index]) %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}")))) %>% 
+    mutate(avg_velo_Sinker = proj_velo)
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, metric = "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  si_val$proj_y[index] = proj_y
+  si_val$mean_rmse[index] = best_params$mean
+  si_val$rmse_se[index] = best_params$std_err
+  si_val$norm_rmse[index] = best_params$mean / 
+    (max(model_data$avg_y_Sinker) -
+       min(model_data$avg_y_Sinker))
+
+  # clear parallel processing
+  future::plan("sequential")
+  doParallel::stopImplicitCluster()
+}
+
+si_val %>% 
+  select(pitcher, cluster, game_year,
+         avg_y_Sinker, proj_y, mean_rmse, rmse_se, norm_rmse) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_Sinker") %>%
+  mutate(proj_y = proj_y %>% as.numeric(),
+         mean_rmse = mean_rmse %>% as.numeric(),
+         rmse_se = rmse_se %>% as.numeric(),
+         accurate = ifelse(avg_y < proj_y + mean_rmse & 
+                             avg_y > proj_y - mean_rmse, 1, 0)) -> si_val
+```
+
+
+# Slider Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_sl == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>%
+  drop_na(avg_y_Slider) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_,  
+         norm_rmse = NA_character_) -> sl_val
+
+val_pit = list(pitcher = sl_val$pitcher,
+               cluster = sl_val$cluster)
+
+index = 0
+
+for (pit in val_pit$pitcher) {
+  index = index + 1
+
+  # previous year for similarity
+  prev_year = similarity %>% 
+    filter(pitcher1 == pit) %>% 
+    distinct(year1) %>% 
+    arrange(desc(year1)) %>% 
+    filter(year1 != 2023) %>% 
+    slice_head() %>% 
+    .[[1]]
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             # standardized > 0.5 &
+             year1 == prev_year) %>% 
+    select(pitcher2, standardized, cluster2, year2) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "Slider"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    right_join(case_weights, by = c("pitcher" = "pitcher2",
+                                    "cluster" = "cluster2",
+                                    "game_year" = "year2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"))
+  
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) %>% 
+    arrange(desc(case_wts)) %>% 
+    slice_head(n = 200) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = avg_y_Slider)
+  
+  formula <-
+    recipe(avg_y_Slider ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  future::plan("multisession")
+  doParallel::registerDoParallel(cores = 2)
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 50,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, metric = "rmse") %>% 
+    slice_head()
+  
+  proj_velo = velo_val %>% 
+    filter(pitcher == pit &
+             cluster == sl_val$cluster[index] &
+             pitch_type == proj_pit) %>% 
+    pull(proj_velo) %>% 
+    .[[1]]
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & 
+             game_year == 2023 &
+             cluster == val_pit$cluster[index]) %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}")))) %>% 
+    mutate(avg_velo_Slider = proj_velo)
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, metric = "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  sl_val$proj_y[index] = proj_y
+  sl_val$mean_rmse[index] = best_params$mean
+  sl_val$rmse_se[index] = best_params$std_err
+  sl_val$norm_rmse[index] = best_params$mean / 
+    (max(model_data$avg_y_Slider) -
+       min(model_data$avg_y_Slider))
+
+  # clear parallel processing
+  future::plan("sequential")
+  doParallel::stopImplicitCluster()
+}
+
+sl_val %>% 
+  select(pitcher, cluster, game_year,
+         avg_y_Slider, proj_y, mean_rmse, rmse_se, norm_rmse) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_Slider") %>%
+  mutate(proj_y = proj_y %>% as.numeric(),
+         mean_rmse = mean_rmse %>% as.numeric(),
+         rmse_se = rmse_se %>% as.numeric(),
+         accurate = ifelse(avg_y < proj_y + mean_rmse & 
+                             avg_y > proj_y - mean_rmse, 1, 0)) -> sl_val
+```
+
+
+# Split-Finger Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_sp == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>%
+  drop_na(`avg_y_Split-Finger`) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_,  
+         norm_rmse = NA_character_) -> sp_val
+
+val_pit = list(pitcher = sp_val$pitcher,
+               cluster = sp_val$cluster)
+
+index = 0
+
+for (pit in val_pit$pitcher) {
+  index = index + 1
+
+  # previous year for similarity
+  prev_year = similarity %>% 
+    filter(pitcher1 == pit) %>% 
+    distinct(year1) %>% 
+    arrange(desc(year1)) %>% 
+    filter(year1 != 2023) %>% 
+    slice_head() %>% 
+    .[[1]]
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             # standardized > 0.5 &
+             year1 == prev_year) %>% 
+    select(pitcher2, standardized, cluster2, year2) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "Split-Finger"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    right_join(case_weights, by = c("pitcher" = "pitcher2",
+                                    "cluster" = "cluster2",
+                                    "game_year" = "year2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"))
+  
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) %>% 
+    arrange(desc(case_wts)) %>% 
+    slice_head(n = 200) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = `avg_y_Split-Finger`)
+  
+  formula <-
+    recipe(`avg_y_Split-Finger` ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  future::plan("multisession")
+  doParallel::registerDoParallel(cores = 2)
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 50,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, metric = "rmse") %>% 
+    slice_head()
+  
+  proj_velo = velo_val %>% 
+    filter(pitcher == pit &
+             cluster == sp_val$cluster[index] &
+             pitch_type == proj_pit) %>% 
+    pull(proj_velo) %>% 
+    .[[1]]
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & 
+             game_year == 2023 &
+             cluster == val_pit$cluster[index]) %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}")))) %>% 
+    mutate(`avg_y_Split-Finger` = proj_velo)
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, metric = "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  sp_val$proj_y[index] = proj_y
+  sp_val$mean_rmse[index] = best_params$mean
+  sp_val$rmse_se[index] = best_params$std_err
+  sp_val$norm_rmse[index] = best_params$mean / 
+    (max(model_data$`avg_y_Split-Finger`) -
+       min(model_data$`avg_y_Split-Finger`))
+
+  # clear parallel processing
+  future::plan("sequential")
+  doParallel::stopImplicitCluster()
+}
+
+sp_val %>% 
+  select(pitcher, cluster, game_year,
+         `avg_y_Split-Finger`, proj_y, mean_rmse, rmse_se, norm_rmse) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_Split-Finger") %>%
+  mutate(proj_y = proj_y %>% as.numeric(),
+         mean_rmse = mean_rmse %>% as.numeric(),
+         rmse_se = rmse_se %>% as.numeric(),
+         accurate = ifelse(avg_y < proj_y + mean_rmse & 
+                             avg_y > proj_y - mean_rmse, 1, 0)) -> sp_val
+```
+
+
+# Sweeper Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_sw == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>%
+  drop_na(avg_y_Sweeper) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_,  
+         norm_rmse = NA_character_) -> sw_val
+
+val_pit = list(pitcher = sw_val$pitcher,
+               cluster = sw_val$cluster)
+
+index = 0
+
+for (pit in val_pit$pitcher) {
+  index = index + 1
+
+  # previous year for similarity
+  prev_year = similarity %>% 
+    filter(pitcher1 == pit) %>% 
+    distinct(year1) %>% 
+    arrange(desc(year1)) %>% 
+    filter(year1 != 2023) %>% 
+    slice_head() %>% 
+    .[[1]]
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             # standardized > 0.5 &
+             year1 == prev_year) %>% 
+    select(pitcher2, standardized, cluster2, year2) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "Sweeper"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    right_join(case_weights, by = c("pitcher" = "pitcher2",
+                                    "cluster" = "cluster2",
+                                    "game_year" = "year2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"))
+  
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) %>% 
+    arrange(desc(case_wts)) %>% 
+    slice_head(n = 200) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = avg_y_Sweeper)
+  
+  formula <-
+    recipe(avg_y_Sweeper ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  future::plan("multisession")
+  doParallel::registerDoParallel(cores = 2)
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 50,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, metric = "rmse") %>% 
+    slice_head()
+  
+  proj_velo = velo_val %>% 
+    filter(pitcher == pit &
+             cluster == sw_val$cluster[index] &
+             pitch_type == proj_pit) %>% 
+    pull(proj_velo) %>% 
+    .[[1]]
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & 
+             game_year == 2023 &
+             cluster == val_pit$cluster[index]) %>% 
+    select(-c(pitcher, cluster, game_year, p_throws, starts_with("n_obs"))) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}")))) %>% 
+    mutate(avg_velo_Sweeper = proj_velo)
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, metric = "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  sw_val$proj_y[index] = proj_y
+  sw_val$mean_rmse[index] = best_params$mean
+  sw_val$rmse_se[index] = best_params$std_err
+  sw_val$norm_rmse[index] = best_params$mean / 
+    (max(model_data$avg_y_Sweeper) -
+       min(model_data$avg_y_Sweeper))
+
+  # clear parallel processing
+  future::plan("sequential")
+  doParallel::stopImplicitCluster()
+}
+
+sw_val %>% 
+  select(pitcher, cluster, game_year,
+         avg_y_Sweeper, proj_y, mean_rmse, rmse_se, norm_rmse) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_Sweeper") %>%
+  mutate(proj_y = proj_y %>% as.numeric(),
+         mean_rmse = mean_rmse %>% as.numeric(),
+         rmse_se = rmse_se %>% as.numeric(),
+         accurate = ifelse(avg_y < proj_y + mean_rmse & 
+                             avg_y > proj_y - mean_rmse, 1, 0)) -> sw_val
+```
+
+
+# merge validation sets
+
+```{r}
+y_val = list(ff_val, ch_val, cu_val, ct_val,
+             si_val, sl_val, sp_val, sw_val) %>% 
+  bind_rows()
+
+write.csv(y_val, "y_val.csv")
+```
+
+
+# run all of the above
+
+```{r}
+# RUN ALL CHUNKS FOR PITCH Y MOVEMENT VALIDATION
+```
+
+# unused validation chunk:
+# Knuckle Curve Validation
+
+```{r}
+val_pit = pitch_mixes %>% 
+  filter(game_year == 2023 & new_kc == 1) %>% 
+  distinct(pitcher) %>% 
+  .[[1]]
+
+pitch_shapes %>% 
+  filter(game_year == 2023 & 
+           pitcher %in% val_pit) %>% 
+  mutate(proj_y = NA_character_,
+         mean_rmse = NA_character_,
+         rmse_se = NA_character_) -> kc_val
+
+index = 0
+
+for (pit in val_pit) {
+  index = index + 1
+  
+  # case weights and creating dataset for model
+  similarity %>% 
+    filter(pitcher1 == pit &
+             standardized > 0.5) %>% 
+    select(pitcher2, standardized) -> case_weights
+  sim_pitchers = case_weights %>% distinct(pitcher2) %>% .[[1]]
+  pit_throws = data %>% filter(pitcher == pit) %>% 
+    slice_head() %>% select(p_throws) %>% .[[1]]
+  
+  # create model data
+  proj_pit = "Knuckle Curve"
+  pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher %in% sim_pitchers &
+             p_throws == pit_throws) %>% 
+    left_join(case_weights, by = c("pitcher" = "pitcher2")) %>% 
+    rename("case_wts" = "standardized") %>% 
+    mutate(case_wts = ifelse(pitcher == pit, 1, case_wts)) %>% 
+    select(-c(pitcher, game_year, p_throws)) %>% 
+    mutate(case_wts = importance_weights(case_wts)) -> model_data
+  rm_cols = c(glue::glue("avg_x_{proj_pit}"),
+              glue::glue("avg_aa_{proj_pit}"))
+  model_data %>% 
+    select(-all_of(rm_cols)) %>% 
+    drop_na(glue::glue("avg_y_{proj_pit}")) -> model_data
+  
+  # model preprocessing
+  set.seed(get_seed())
+  
+  folds <- vfold_cv(model_data, v = 3, strata = `avg_y_Knuckle Curve`)
+  
+  formula <-
+    recipe(`avg_y_Knuckle Curve` ~ .,
+           data = model_data
+    )
+  
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      tree_depth = tune(),
+      min_n = tune(),
+      loss_reduction = tune(),
+      sample_size = tune(),
+      mtry = tune(),
+      learn_rate = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  workflow <- workflow(formula, specifications) %>% 
+    add_case_weights(case_wts)
+  
+  # run model
+  doParallel::registerDoParallel()
+  
+  xgb_rs <- finetune::tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 10,
+    metrics = metric_set(rmse),
+    control = finetune::control_race(verbose_elim = F, 
+                                     burn_in = 2)
+  )
+  
+  # gather model results
+  best_params = show_best(xgb_rs, n = 15) %>% 
+    slice_head()
+  
+  proj_pitcher = pitch_shapes %>% 
+    ungroup() %>% 
+    filter(pitcher == pit & game_year == 2023) %>% 
+    select(-c(pitcher, game_year, p_throws)) %>% 
+    select(-all_of(c(rm_cols, glue::glue("avg_y_{proj_pit}"))))
+  
+  fit_model <- workflow %>% 
+   finalize_workflow(
+     select_best(xgb_rs, "rmse")
+   ) %>% 
+    fit(model_data)
+  
+  proj_y = fit_model %>% 
+    predict(proj_pitcher) %>% 
+    pull()
+  
+  kc_val$proj_y[index] = proj_y
+  kc_val$mean_rmse[index] = best_params$mean
+  kc_val$rmse_se[index] = best_params$std_err
+}
+
+kc_val %>% 
+  select(`avg_y_Knuckle Curve`, proj_y, mean_rmse, rmse_se) %>% 
+  mutate(pitch_type = proj_pit) %>% 
+  rename("avg_y" = "avg_y_Knuckle Curve") -> kc_val
+```
